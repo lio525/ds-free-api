@@ -27,6 +27,23 @@ pub(crate) const MAX_XML_BUF_LEN: usize = 64 * 1024;
 
 pub(crate) const TOOL_CALL_START: &str = "<|tool▁calls▁begin|>";
 pub(crate) const TOOL_CALL_END: &str = "<|tool▁calls▁end|>";
+
+/// 原生 DSML 工具调用块开始/结束标记。
+///
+/// 上游模型有时不按注入式信封（`<|tool▁calls▁begin|>` … `<|tool▁calls▁end|>`）
+/// 输出，而是直接用 DSML 标签 `<|calls|>` … `<|/calls|>`（模型还可能把左分隔符
+/// 写成全角「｜」、下划线写「▁」）。这些形状必须与注入式共用同一条检测路径，
+/// 否则会被当作普通 content 原样回显给客户端（表现为 `finish_reason: stop`、
+/// `tool_calls: []`、标签泄漏）。归一化由 `norm_tag_char` / `fuzzy_match_tag`
+/// 统一处理，所以这里用 ASCII 形式即可覆盖全角变体。
+pub(crate) const DSML_CALL_START: &str = "<|calls|>";
+pub(crate) const DSML_CALL_END: &str = "<|/calls|>";
+
+/// 原生 DSML 里单个工具调用的打开标记（`<|invoke name="..."|>`）。
+/// 用于让开始标记检测也能在「已进入但没写 `<|calls|>`」的原生输出上触发。
+pub(crate) const DSML_INVOKE_START: &str = "<|invoke";
+/// 原生 DSML 里参数块的打开标记（`<|parameter name="..."|>`）。
+pub(crate) const DSML_PARAM_START: &str = "<|parameter";
 const W: usize = 71;
 
 const KEEPALIVE_INTERVAL: Duration = Duration::from_secs(1);
@@ -100,6 +117,11 @@ pub(crate) fn contains_start_tag_with(s: &str, cfg: &TagConfig) -> bool {
     if match_start_tag(s, TOOL_CALL_START).is_some() {
         return true;
     }
+    for dsml in [DSML_CALL_START, DSML_INVOKE_START, DSML_PARAM_START] {
+        if match_start_tag(s, dsml).is_some() {
+            return true;
+        }
+    }
     for start in &cfg.starts {
         if match_start_tag(s, start).is_some() {
             return true;
@@ -111,6 +133,11 @@ pub(crate) fn contains_start_tag_with(s: &str, cfg: &TagConfig) -> bool {
 pub(crate) fn find_start_tag_with<'a>(s: &'a str, cfg: &TagConfig) -> Option<(usize, &'a str)> {
     if let Some(m) = match_start_tag(s, TOOL_CALL_START) {
         return Some(m);
+    }
+    for dsml in [DSML_CALL_START, DSML_INVOKE_START, DSML_PARAM_START] {
+        if let Some(m) = match_start_tag(s, dsml) {
+            return Some(m);
+        }
     }
     for start in &cfg.starts {
         if let Some(m) = match_start_tag(s, start) {
@@ -142,8 +169,11 @@ pub(crate) fn find_end_tag_with<'a>(
         }
     }
 
-    // 无论 start_tag 是否提供，都尝试已知结束标签
-    for end in std::iter::once(TOOL_CALL_END).chain(cfg.ends.iter().map(|s| s.as_str())) {
+    // 无论 start_tag 是否提供，都尝试已知结束标签（含原生 DSML 的 `<|/calls|>`）
+    for end in std::iter::once(TOOL_CALL_END)
+        .chain(std::iter::once(DSML_CALL_END))
+        .chain(cfg.ends.iter().map(|s| s.as_str()))
+    {
         if let Some(pos) = search.find(end) {
             let abs = from + pos;
             return Some((abs, &s[abs..abs + end.len()]));
@@ -163,6 +193,11 @@ pub(crate) fn find_end_tag_with<'a>(
     if let Some((pos, tag)) = match_start_tag(search, TOOL_CALL_START) {
         return Some((from + pos, &s[from + pos..from + pos + tag.len()]));
     }
+    for dsml in [DSML_CALL_START, DSML_INVOKE_START, DSML_PARAM_START] {
+        if let Some((pos, tag)) = match_start_tag(search, dsml) {
+            return Some((from + pos, &s[from + pos..from + pos + tag.len()]));
+        }
+    }
     for start in &cfg.starts {
         if let Some((pos, tag)) = match_start_tag(search, start) {
             return Some((from + pos, &s[from + pos..from + pos + tag.len()]));
@@ -172,7 +207,10 @@ pub(crate) fn find_end_tag_with<'a>(
 }
 
 fn is_start_tag(tag: &str, cfg: &TagConfig) -> bool {
-    if !tag.starts_with('<') {
+    // 原生 DSML 允许全角「｜」当左分隔符，归一化后为无前导「<」的 `|calls|>` /
+    // `|invoke` / `|parameter`；因此不再强制要求以「<」开头。
+    let first = tag.chars().next().map(norm_tag_char);
+    if !matches!(first, Some('<') | Some('|')) {
         return false;
     }
     let partial = TOOL_CALL_START.trim_end_matches('>');
@@ -180,6 +218,16 @@ fn is_start_tag(tag: &str, cfg: &TagConfig) -> bool {
     let partial_norm: String = partial.chars().map(norm_tag_char).collect();
     if partial_norm.starts_with(&tag_norm) || tag_norm.starts_with(&partial_norm) {
         return true;
+    }
+    for dsml in [DSML_CALL_START, DSML_INVOKE_START, DSML_PARAM_START] {
+        let p: String = dsml
+            .trim_end_matches('>')
+            .chars()
+            .map(norm_tag_char)
+            .collect();
+        if p.starts_with(&tag_norm) || tag_norm.starts_with(&p) {
+            return true;
+        }
     }
     for start in &cfg.starts {
         let p: String = start
@@ -346,7 +394,18 @@ pub fn parse_tool_calls_with(xml: &str, cfg: &TagConfig) -> Option<(Vec<ToolCall
                     })?;
                 vec![obj]
             } else {
-                return parse_invoke_calls(inner, &xml[..start], &xml[end..]);
+                // 优先按注入式 XML 解析。
+                if let Some(r) = parse_invoke_calls(inner, &xml[..start], &xml[end..]) {
+                    return Some(r);
+                }
+                // 注入式解析不到但 inner 里是原生 DSML 工具块时，转成语义等价的
+                // 注入式 XML 再试一次。仍失败则返回 None，由调用方走 repair 管线
+                // （绝不把 `<｜…>` 标签回显为 content）。
+                let native = normalize_invoke_xml(inner);
+                if native != inner {
+                    return parse_invoke_calls(&native, &xml[..start], &xml[end..]);
+                }
+                return None;
             }
         }
     };
@@ -381,6 +440,30 @@ pub fn parse_tool_calls_with(xml: &str, cfg: &TagConfig) -> Option<(Vec<ToolCall
     }
     let remaining = format!("{}{}", &xml[..start], &xml[end..]);
     Some((calls, remaining))
+}
+
+/// 把原生 DSML 工具调用块转成语义等价的注入式 XML，供 `parse_invoke_calls` 解析。
+///
+/// 上游模型自主输出原生 DSML 时，标签形态是 `<|invoke name="X|>`、
+/// `<|parameter name="Y|>`、`<|/invoke|>`、`<|/parameter|>`（全角变体把 `|` 写成
+/// 「｜」、`_` 写成「▁」）。注入式解析器 `parse_invoke_calls` 认 `<invoke `、
+/// `<parameter `、`</invoke>`、`</parameter>`，因此先把已知的原生标签形态归一化并
+/// 转成注入式形态。转换不了的字符原样保留——转换后仍解析失败时，调用方走
+/// repair 管线，绝不把原生标记回显为 content。
+fn normalize_invoke_xml(inner: &str) -> String {
+    // 1) 全角「｜」/「▁」先归一化为半角 `|`/`_`。
+    let norm: String = inner.chars().map(norm_tag_char).collect();
+    // 2) 已知原生标签形态 → 注入式形态。
+    let out = norm
+        .replace("<|invoke ", "<invoke ")
+        .replace("<|parameter ", "<parameter ")
+        .replace("<|/invoke|>", "</invoke>")
+        .replace("<|/parameter|>", "</parameter>")
+        .replace("<|calls|>", "")
+        .replace("<|/calls|>", "")
+        .replace("<|fin|>", "");
+    // 3) 引号不闭合的原生属性 `name="X|>` → `name="X">`（把 `|>` 视作值闭合）。
+    out.replace("\"|>", "\">")
 }
 
 fn parse_invoke_calls(inner: &str, prefix: &str, suffix: &str) -> Option<(Vec<ToolCall>, String)> {
@@ -1023,5 +1106,33 @@ mod tests {
             delta.tool_calls
         );
         assert!(delta.content.is_none(), "保活心跳不得携带 content");
+    }
+
+    /// 原生 DSML 工具调用块：`<|calls|>…<|/calls|>` 里是 `<|invoke name="X|>` /
+    /// `<|parameter name="Y|>`，应被当作工具调用解析，而非把标记回显为 content。
+    #[test]
+    fn parse_native_dsml_invoke_calls() {
+        let xml = "<|calls|><|invoke name=\"terminal|><|parameter name=\"command|>pwd<|/parameter|><|/invoke|><|/calls|><|fin|>";
+        let (calls, remaining) = parse_tool_calls(&xml).expect("原生 DSML 应被解析成工具调用");
+        assert_eq!(calls.len(), 1);
+        let f = calls[0].function.as_ref().unwrap();
+        assert_eq!(f.name, "terminal");
+        assert!(f.arguments.contains("pwd"));
+        assert!(!remaining.contains("invoke"), "调用标签不得回显为剩余文本");
+    }
+
+    /// 原生 DSML 用全角「｜」(U+FF5C) 当左分隔符时，应通过归一化被识别并解析。
+    #[test]
+    fn parse_native_dsml_fullwidth_delimiters() {
+        let xml = "<\u{FF5C}calls\u{FF5C}><\u{FF5C}invoke name=\"bash\u{FF5C}><\u{FF5C}parameter name=\"command\u{FF5C}>echo ok<\u{FF5C}/parameter\u{FF5C}><\u{FF5C}/invoke\u{FF5C}><\u{FF5C}/calls\u{FF5C}><\u{FF5C}fin\u{FF5C}>";
+        let (calls, remaining) = parse_tool_calls(&xml).expect("全角原生 DSML 应被解析");
+        assert_eq!(calls.len(), 1);
+        let f = calls[0].function.as_ref().unwrap();
+        assert_eq!(f.name, "bash");
+        assert!(f.arguments.contains("echo"));
+        // 全角原生的调用主体标记不得回显；剩余文本只允许 `<|fin|>` 之类的收尾。
+        assert!(!remaining.contains("invoke"), "invoke 标记不得回显");
+        assert!(!remaining.contains("parameter"), "parameter 标记不得回显");
+        assert!(!remaining.contains("calls"), "calls 标记不得回显");
     }
 }
