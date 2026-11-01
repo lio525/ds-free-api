@@ -210,7 +210,7 @@ fn is_start_tag(tag: &str, cfg: &TagConfig) -> bool {
     // 原生 DSML 允许全角「｜」当左分隔符，归一化后为无前导「<」的 `|calls|>` /
     // `|invoke` / `|parameter`；因此不再强制要求以「<」开头。
     let first = tag.chars().next().map(norm_tag_char);
-    if !matches!(first, Some('<') | Some('|')) {
+    if !matches!(first, Some('<' | '|')) {
         return false;
     }
     let partial = TOOL_CALL_START.trim_end_matches('>');
@@ -1113,7 +1113,7 @@ mod tests {
     #[test]
     fn parse_native_dsml_invoke_calls() {
         let xml = "<|calls|><|invoke name=\"terminal|><|parameter name=\"command|>pwd<|/parameter|><|/invoke|><|/calls|><|fin|>";
-        let (calls, remaining) = parse_tool_calls(&xml).expect("原生 DSML 应被解析成工具调用");
+        let (calls, remaining) = parse_tool_calls(xml).expect("原生 DSML 应被解析成工具调用");
         assert_eq!(calls.len(), 1);
         let f = calls[0].function.as_ref().unwrap();
         assert_eq!(f.name, "terminal");
@@ -1125,7 +1125,7 @@ mod tests {
     #[test]
     fn parse_native_dsml_fullwidth_delimiters() {
         let xml = "<\u{FF5C}calls\u{FF5C}><\u{FF5C}invoke name=\"bash\u{FF5C}><\u{FF5C}parameter name=\"command\u{FF5C}>echo ok<\u{FF5C}/parameter\u{FF5C}><\u{FF5C}/invoke\u{FF5C}><\u{FF5C}/calls\u{FF5C}><\u{FF5C}fin\u{FF5C}>";
-        let (calls, remaining) = parse_tool_calls(&xml).expect("全角原生 DSML 应被解析");
+        let (calls, remaining) = parse_tool_calls(xml).expect("全角原生 DSML 应被解析");
         assert_eq!(calls.len(), 1);
         let f = calls[0].function.as_ref().unwrap();
         assert_eq!(f.name, "bash");
