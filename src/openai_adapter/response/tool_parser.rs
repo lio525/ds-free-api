@@ -462,8 +462,9 @@ fn normalize_invoke_xml(inner: &str) -> String {
         .replace("<|calls|>", "")
         .replace("<|/calls|>", "")
         .replace("<|fin|>", "");
-    // 3) 引号不闭合的原生属性 `name="X|>` → `name="X">`（把 `|>` 视作值闭合）。
-    out.replace("\"|>", "\">")
+    // 3) 属性值的管道闭合：`name="X"|>` 与省略引号的 `name="X|>` 都要收成 `name="X">`。
+    let out = out.replace("\"|>", "\">");
+    out.replace("|>", "\">")
 }
 
 fn parse_invoke_calls(inner: &str, prefix: &str, suffix: &str) -> Option<(Vec<ToolCall>, String)> {
